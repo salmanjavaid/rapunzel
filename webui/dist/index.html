@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rapunzel</title>
+    <link rel="stylesheet" href="./app.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="panel sidebar">
+        <div class="toolbar">
+          <button id="new-root" class="primary-action">New Root</button>
+          <button id="new-child">New Child</button>
+        </div>
+        <div class="toolbar toolbar-secondary">
+          <button id="rename">Rename</button>
+          <button id="move-up">Up</button>
+          <button id="move-down">Down</button>
+          <button id="toggle-collapse">Collapse</button>
+          <button id="close">Close</button>
+        </div>
+        <div id="tree" class="tree-shell"></div>
+      </aside>
+
+      <section class="panel detail">
+        <header class="detail-header">
+          <div class="header-copy">
+            <div class="eyebrow">Active Branch</div>
+            <h1 id="active-title" class="active-title">No branch selected</h1>
+            <div id="active-meta" class="active-meta">
+              Create a root branch to start a new workspace thread.
+            </div>
+          </div>
+          <div class="header-pill">Live PTY</div>
+        </header>
+
+        <section id="terminal-card" class="terminal-card">
+          <div class="terminal-header">
+            <div>
+              <div class="terminal-title">Conversation Surface</div>
+              <div class="terminal-subtitle">Interactive shell output with live PTY sync</div>
+            </div>
+          </div>
+          <div id="terminal-mount" class="terminal-mount"></div>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

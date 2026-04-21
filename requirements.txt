@@ -1,0 +1,4 @@
+pyte
+pywebview
+PySide6
+qtpy

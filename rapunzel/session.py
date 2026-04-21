@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import pty
+import select
 import signal
 import subprocess
 import termios
 import threading
+import time
 from dataclasses import dataclass, field
 from fcntl import ioctl
 from typing import Callable
@@ -35,6 +37,7 @@ class PTYSession:
     _closed: threading.Event = field(init=False, default_factory=threading.Event, repr=False)
     _reader_thread: threading.Thread | None = field(init=False, default=None, repr=False)
     _wait_thread: threading.Thread | None = field(init=False, default=None, repr=False)
+    _fd_lock: threading.Lock = field(init=False, default_factory=threading.Lock, repr=False)
 
     def start(self) -> None:
         master_fd, slave_fd = pty.openpty()
@@ -90,25 +93,71 @@ class PTYSession:
             return
 
         self._closed.set()
-        if self.process is not None and self.process.poll() is None:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        if self._reader_thread is not None and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=0.2)
 
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
+        self._close_master_fd()
+        self._terminate_process_group()
+
+    def _close_master_fd(self) -> None:
+        with self._fd_lock:
+            master_fd = self.master_fd
             self.master_fd = None
 
-    def _read_loop(self) -> None:
-        assert self.master_fd is not None
-
-        while not self._closed.is_set():
+        if master_fd is not None:
             try:
-                chunk = os.read(self.master_fd, 4096)
+                os.close(master_fd)
+            except OSError:
+                pass
+
+    def _terminate_process_group(self) -> None:
+        process = self.process
+        if process is None or process.poll() is not None:
+            return
+
+        pid = process.pid
+        signal_plan = (
+            (signal.SIGHUP, 0.12),
+            (signal.SIGTERM, 0.18),
+            (signal.SIGKILL, 0.0),
+        )
+
+        for sig, delay in signal_plan:
+            try:
+                os.killpg(pid, sig)
+            except ProcessLookupError:
+                return
+
+            deadline = time.monotonic() + delay
+            while delay and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    return
+                time.sleep(0.02)
+
+            if process.poll() is not None:
+                return
+
+    def _read_loop(self) -> None:
+        while True:
+            if self._closed.is_set():
+                break
+
+            master_fd = self.master_fd
+            if master_fd is None:
+                break
+
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.1)
+            except (OSError, ValueError):
+                break
+
+            if not ready:
+                continue
+
+            try:
+                chunk = os.read(master_fd, 4096)
+            except BlockingIOError:
+                continue
             except OSError:
                 break
 
@@ -122,10 +171,5 @@ class PTYSession:
 
         exit_code = self.process.wait()
         self._closed.set()
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-            self.master_fd = None
+        self._close_master_fd()
         self.on_exit(self.session_id, exit_code)

@@ -1,5 +1,23 @@
 __pycache__/
 *.py[cod]
 .venv/
+.deps/
+.build-deps/
+.build-assets/
+.pyinstaller/
+node_modules/
 .python-version
 .DS_Store
+/build/
+/dist/
+/Rapunzel.app/
+/rapunzel-launch.log
+/webui/dist/app.js
+/webui/dist/app.css
+/GEMINI_HANDOFF.md
+/USER_OBSERVATIONS.md
+/gemini issue.png
+/test_frontend.py
+/test_max_input.py
+/test_wrap.py
+/test_wrap2.py
