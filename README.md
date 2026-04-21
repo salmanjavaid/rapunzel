@@ -4,7 +4,7 @@
 
 # Rapunzel
 
-Rapunzel is a minimal desktop workspace for running many AI agent terminals as a tree.
+Rapunzel is a browser but for agents.
 
 I built rapunzel because in the MacOS terminal, I had many agents running across tabs but they were difficult to track. I built it because I love the Tree Style Tab Extension in Firefox. I built it because, it is the time for Chrome, but for agents. I made it, to make it as simple as possible and nothing more.
 
