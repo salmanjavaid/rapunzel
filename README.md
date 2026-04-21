@@ -38,6 +38,8 @@ For normal use:
 ./Rapunzel.command
 ```
 
+You can also double-click `Rapunzel.command` in Finder.
+
 For development:
 
 ```bash
@@ -75,6 +77,8 @@ bash build_macos_app.sh
 Output:
 
 - `dist/Rapunzel.app`
+
+After the build finishes, open `dist/Rapunzel.app` from Finder or double-click it directly.
 
 ## Notes
 
