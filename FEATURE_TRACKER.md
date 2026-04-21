@@ -55,6 +55,7 @@ Prototype stage. The app is now a Python desktop prototype with a pywebview shel
 - Fixed app shutdown hangs caused by PTY close on macOS: the reader thread now uses a timed `select` loop, and session teardown closes the PTY safely before escalating from `SIGHUP` to `SIGTERM` and `SIGKILL` if needed.
 - Added app icon wiring for both source runs and macOS bundle builds, using the repo's `icon.png` and generating `.icns` build assets automatically.
 - Set the application icon explicitly for source runs on Qt/macOS so the app icon shows in the Dock/taskbar even when launched from VS Code instead of only from a packaged bundle.
+- Refined the app icon asset into a true square dock/taskbar icon from the uploaded concept art, removing presentation text and wide-layout whitespace so it reads cleanly at app-icon sizes.
 
 ## Known Gaps
 
