@@ -62,7 +62,7 @@ class TerminalScreen:
         cursor_row = max(0, len(history_lines) + self._screen.cursor.y - overflow)
         cursor_row = min(cursor_row, max(0, len(composed_lines) - 1))
         return TerminalSnapshot(
-            text="\n".join(composed_lines),
+            text="\r\n".join(composed_lines),
             cursor_row=cursor_row,
             cursor_col=max(0, self._screen.cursor.x),
         )

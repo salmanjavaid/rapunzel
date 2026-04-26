@@ -76,12 +76,14 @@ function bindActions() {
   elements.newRoot.addEventListener('click', async () => {
     const ui = await window.pywebview.api.create_root();
     await applyUiState(ui, true);
+    focusSelectedTerminal();
   });
 
   elements.newChild.addEventListener('click', async () => {
     if (!state.selectedSessionId) return;
     const ui = await window.pywebview.api.create_child();
     await applyUiState(ui, true);
+    focusSelectedTerminal();
   });
 
   elements.rename.addEventListener('click', renameSelected);
@@ -168,6 +170,7 @@ async function selectSession(sessionId) {
   hideContextMenu();
   const ui = await window.pywebview.api.select_session(sessionId);
   await applyUiState(ui, true);
+  focusSelectedTerminal();
 }
 
 async function sendInput(data) {
@@ -283,12 +286,20 @@ async function hydrateSelectedTerminal() {
     entry.term.write(entry.pendingPush);
     entry.pendingPush = '';
   }
+
 }
 
 function writeToTerminal(term, data) {
   return new Promise((resolve) => {
     term.write(data, resolve);
   });
+}
+
+function focusSelectedTerminal() {
+  const entry = selectedTerminalEntry();
+  if (entry) {
+    requestAnimationFrame(() => entry.term.focus());
+  }
 }
 
 function renderHeader(selected) {
@@ -326,6 +337,7 @@ function renderTree(nodes) {
   newRootRow.addEventListener('click', async () => {
     const ui = await window.pywebview.api.create_root();
     await applyUiState(ui, true);
+    focusSelectedTerminal();
   });
   fragment.appendChild(newRootRow);
 
@@ -665,6 +677,7 @@ async function handleContextMenuAction(event) {
   if (action === 'new-root') {
     const ui = await window.pywebview.api.create_root();
     await applyUiState(ui, true);
+    focusSelectedTerminal();
     return;
   }
 
@@ -675,6 +688,7 @@ async function handleContextMenuAction(event) {
   if (action === 'new-child') {
     const ui = await window.pywebview.api.create_child_under(sessionId);
     await applyUiState(ui, true);
+    focusSelectedTerminal();
     return;
   }
 
