@@ -22,6 +22,9 @@ from rapunzel.state import AppState
 from rapunzel.store import WorkspaceStore
 
 
+MAX_PUSH_PAYLOAD_CHARS = 128_000
+
+
 def app_icon_path() -> str | None:
     path = Path(__file__).resolve().parent.parent / "icon.png"
     return str(path) if path.exists() else None
@@ -67,8 +70,9 @@ class RapunzelBridge:
         self._window: webview.Window | None = None
         self._js_ready = threading.Event()
         self._output_lock = threading.Lock()
-        self._output_buf: dict[str, list[str]] = {}
+        self._output_buf: dict[str, list[tuple[int, str]]] = {}
         self._flush_scheduled = False
+        self._flush_in_progress = False
         self._state = AppState(
             self._store,
             push_output=self._push_output,
@@ -87,13 +91,15 @@ class RapunzelBridge:
         """Called from JS once the page is loaded and push handlers exist."""
         self._js_ready.set()
 
-    def _push_output(self, session_id: str, data: str) -> None:
+    def _push_output(self, session_id: str, data: str, sequence: int) -> None:
         if not self._js_ready.is_set() or self._window is None:
+            return
+        if session_id != self._state.selected_session_id:
             return
 
         with self._output_lock:
-            self._output_buf.setdefault(session_id, []).append(data)
-            if self._flush_scheduled:
+            self._output_buf.setdefault(session_id, []).append((sequence, data))
+            if self._flush_scheduled or self._flush_in_progress:
                 return
             self._flush_scheduled = True
 
@@ -103,26 +109,72 @@ class RapunzelBridge:
 
     def _flush_output(self) -> None:
         with self._output_lock:
-            pending = self._output_buf
-            self._output_buf = {}
+            pending = self._take_pending_output_locked()
             self._flush_scheduled = False
+            self._flush_in_progress = True
 
-        if self._window is None:
-            return
+        try:
+            if self._window is not None:
+                for session_id, chunks in pending.items():
+                    try:
+                        js = f"window.__rapunzelPtyOutput({json.dumps(session_id)},{json.dumps(chunks)})"
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+        finally:
+            should_schedule = False
+            with self._output_lock:
+                self._flush_in_progress = False
+                if self._output_buf and not self._flush_scheduled:
+                    self._flush_scheduled = True
+                    should_schedule = True
 
-        for session_id, chunks in pending.items():
-            merged = "".join(chunks)
-            try:
-                js = f"window.__rapunzelPtyOutput({json.dumps(session_id)},{json.dumps(merged)})"
-                self._window.evaluate_js(js)
-            except Exception:
-                pass
+            if should_schedule:
+                timer = threading.Timer(0.016, self._flush_output)
+                timer.daemon = True
+                timer.start()
 
-    def _push_exit(self, session_id: str, exit_code: int) -> None:
+    def _take_pending_output_locked(self) -> dict[str, list[tuple[int, str]]]:
+        pending: dict[str, list[tuple[int, str]]] = {}
+        remaining_budget = MAX_PUSH_PAYLOAD_CHARS
+
+        for session_id in list(self._output_buf.keys()):
+            chunks = self._output_buf.get(session_id, [])
+            if not chunks or remaining_budget <= 0:
+                continue
+
+            selected: list[tuple[int, str]] = []
+            while chunks and remaining_budget > 0:
+                sequence, data = chunks.pop(0)
+                if len(data) <= remaining_budget:
+                    selected.append((sequence, data))
+                    remaining_budget -= len(data)
+                    continue
+
+                selected.append((sequence, data[:remaining_budget]))
+                chunks.insert(0, (sequence, data[remaining_budget:]))
+                remaining_budget = 0
+
+            if selected:
+                pending[session_id] = selected
+
+            if chunks:
+                self._output_buf[session_id] = chunks
+            else:
+                self._output_buf.pop(session_id, None)
+
+        return pending
+
+    def _push_exit(self, session_id: str, exit_code: int, sequence: int) -> None:
         if not self._js_ready.is_set() or self._window is None:
             return
+        if session_id != self._state.selected_session_id:
+            return
         try:
-            js = f"window.__rapunzelPtyExit({json.dumps(session_id)},{json.dumps(int(exit_code))})"
+            js = (
+                f"window.__rapunzelPtyExit("
+                f"{json.dumps(session_id)},{json.dumps(int(exit_code))},{json.dumps(sequence)})"
+            )
             self._window.evaluate_js(js)
         except Exception:
             pass
@@ -142,6 +194,9 @@ class RapunzelBridge:
 
     def get_session_snapshot(self, session_id: str | None) -> str:
         return self._state.session_snapshot(session_id)
+
+    def get_session_snapshot_payload(self, session_id: str | None) -> dict[str, str | int]:
+        return self._state.session_snapshot_payload(session_id)
 
     def select_session(self, session_id: str | None) -> dict[str, object]:
         self._state.select(session_id)

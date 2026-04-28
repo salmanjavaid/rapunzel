@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rapunzel.models import WorkspaceSnapshot
-from rapunzel.state import AppState
+from rapunzel.state import MAX_TRANSCRIPT_CHARS, AppState
 from rapunzel.store import WorkspaceStore
 
 
@@ -17,8 +17,8 @@ def _make_state(tmp_dir=None):
     pushed_exits = []
     st = AppState(
         store,
-        push_output=lambda sid, data: pushed_output.append((sid, data)),
-        push_exit=lambda sid, code: pushed_exits.append((sid, code)),
+        push_output=lambda sid, data, sequence: pushed_output.append((sid, data, sequence)),
+        push_exit=lambda sid, code, sequence: pushed_exits.append((sid, code, sequence)),
     )
     st._pushed_output = pushed_output
     st._pushed_exits = pushed_exits
@@ -320,6 +320,43 @@ class OutputAndEventsTest(unittest.TestCase):
         st.event_queue.put(SessionEvent("output", sid, "pending"))
         snapshot = st.session_snapshot(sid)
         self.assertIn("pending", snapshot)
+
+    def test_session_snapshot_payload_includes_applied_sequence(self, MockPTY):
+        MockPTY.return_value.start.return_value = None
+        st = _make_state()
+        sid = st.create_root_session()
+
+        from rapunzel.state import SessionEvent
+        st.event_queue.put(SessionEvent("output", sid, "pending", 42))
+        snapshot = st.session_snapshot_payload(sid)
+
+        self.assertIn("pending", snapshot["text"])
+        self.assertEqual(snapshot["sequence"], 42)
+
+    def test_drain_events_batches_output_before_rendering_snapshot(self, MockPTY):
+        MockPTY.return_value.start.return_value = None
+        st = _make_state()
+        sid = st.create_root_session()
+
+        from rapunzel.state import SessionEvent
+        st.event_queue.put(SessionEvent("output", sid, "hello ", 10))
+        st.event_queue.put(SessionEvent("output", sid, "world", 11))
+        events = st.drain_events()
+
+        self.assertEqual(len(events), 2)
+        self.assertIn("hello world", st.terminal_buffers[sid])
+        self.assertEqual(st.applied_sequences[sid], 11)
+
+    def test_terminal_stream_is_bounded_for_long_running_output(self, MockPTY):
+        MockPTY.return_value.start.return_value = None
+        st = _make_state()
+        sid = st.create_root_session()
+        st.terminal_streams[sid] = "a" * (MAX_TRANSCRIPT_CHARS - 5)
+
+        st._append_terminal_stream(sid, "b" * 10)
+
+        self.assertEqual(len(st.terminal_streams[sid]), MAX_TRANSCRIPT_CHARS)
+        self.assertTrue(st.terminal_streams[sid].endswith("b" * 10))
 
 
 @patch("rapunzel.state.PTYSession")

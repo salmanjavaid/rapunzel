@@ -3,6 +3,9 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 
+const MAX_XTERM_WRITE_CHARS = 32_768;
+const XTERM_WRITE_STALL_MS = 8_000;
+
 const state = {
   ui: null,
   selectedSessionId: null,
@@ -12,6 +15,9 @@ const state = {
   contextMenuActionPending: false,
   resizeTimer: null,
   contextMenuTargetId: null,
+  hydrationRequestId: 0,
+  pendingSelectionId: null,
+  selectionRequestId: 0,
   terminals: new Map(),
 };
 
@@ -22,24 +28,52 @@ const elements = {};
 // (same pattern as VS Code's PTY onData → xterm.write)
 // ------------------------------------------------------------------
 
-window.__rapunzelPtyOutput = function (sessionId, data) {
+window.__rapunzelPtyOutput = function (sessionId, chunksOrData, sequence = 0) {
   const entry = terminalEntry(sessionId);
   if (!entry) return;
+  const chunks = normalizePtyChunks(chunksOrData, sequence);
+  if (!chunks.length) return;
 
-  if (!entry.hydrated) {
-    entry.pendingPush = (entry.pendingPush || '') + data;
+  if (sessionId !== state.selectedSessionId) {
+    entry.stale = true;
+    queuePendingPush(entry, chunks);
     return;
   }
 
-  entry.term.write(data);
+  if (!entry.hydrated || entry.hydrating) {
+    queuePendingPush(entry, chunks);
+    return;
+  }
+
+  entry.lastSequence = Math.max(entry.lastSequence || 0, maxChunkSequence(chunks));
+  enqueueTerminalWrite(entry, chunksToData(chunks));
 };
 
 
-window.__rapunzelPtyExit = function (sessionId, exitCode) {
+window.__rapunzelPtyExit = function (sessionId, exitCode, sequence = 0) {
   const entry = terminalEntry(sessionId);
-  if (entry) {
-    entry.term.write(`\r\n[process exited with code ${exitCode}]\r\n`);
+  if (!entry) return;
+
+  const chunks = [
+    {
+      data: `\r\n[process exited with code ${exitCode}]\r\n`,
+      sequence: Number(sequence) || 0,
+    },
+  ];
+
+  if (sessionId !== state.selectedSessionId) {
+    entry.stale = true;
+    queuePendingPush(entry, chunks);
+    return;
   }
+
+  if (!entry.hydrated || entry.hydrating) {
+    queuePendingPush(entry, chunks);
+    return;
+  }
+
+  entry.lastSequence = Math.max(entry.lastSequence || 0, maxChunkSequence(chunks));
+  enqueueTerminalWrite(entry, chunksToData(chunks));
 };
 
 window.addEventListener('pywebviewready', () => {
@@ -151,25 +185,47 @@ async function toggleSelectedCollapsed() {
 async function closeSelected() {
   if (!state.selectedSessionId) return;
   const ui = await window.pywebview.api.close_session(state.selectedSessionId);
-  await applyUiState(ui, true);
+  await applyUiState(ui, false);
 }
 
 async function closeSession(sessionId) {
   if (!sessionId) return;
   const ui = await window.pywebview.api.close_session(sessionId);
-  await applyUiState(ui, true);
+  await applyUiState(ui, false);
 }
 
 async function closeBranch(sessionId) {
   if (!sessionId) return;
   const ui = await window.pywebview.api.close_branch(sessionId);
-  await applyUiState(ui, true);
+  await applyUiState(ui, false);
 }
 
 async function selectSession(sessionId) {
   hideContextMenu();
+  if (!sessionId) return;
+
+  const requestId = ++state.selectionRequestId;
+  state.pendingSelectionId = sessionId;
+  const targetNode = findNode(state.ui?.tree || [], sessionId);
+  if (targetNode && sessionId !== state.selectedSessionId) {
+    await applyUiState(
+      {
+        ...(state.ui || {}),
+        selected_session_id: sessionId,
+        selected: selectedPayloadFromNode(targetNode),
+      },
+      false,
+      { deferTerminalHydration: true },
+    );
+  }
+
   const ui = await window.pywebview.api.select_session(sessionId);
-  await applyUiState(ui, true);
+  if (requestId !== state.selectionRequestId) {
+    return;
+  }
+
+  state.pendingSelectionId = null;
+  await applyUiState(ui, false);
   focusSelectedTerminal();
 }
 
@@ -219,6 +275,13 @@ async function syncUi(resetTerminal) {
 
   try {
     const ui = await window.pywebview.api.get_ui_state();
+    if (
+      state.pendingSelectionId
+      && !resetTerminal
+      && ui.selected_session_id !== state.pendingSelectionId
+    ) {
+      return;
+    }
     await applyUiState(ui, resetTerminal);
   } finally {
     state.syncing = false;
@@ -234,8 +297,15 @@ async function syncUi(resetTerminal) {
   }
 }
 
-async function applyUiState(ui, resetTerminal) {
-  const selectedChanged = ui.selected_session_id !== state.selectedSessionId;
+async function applyUiState(ui, resetTerminal, options = {}) {
+  const previousSelectedId = state.selectedSessionId;
+  const selectedChanged = ui.selected_session_id !== previousSelectedId;
+  if (selectedChanged && previousSelectedId) {
+    const previousEntry = terminalEntry(previousSelectedId);
+    if (previousEntry) {
+      previousEntry.stale = true;
+    }
+  }
 
   state.ui = ui;
   state.selectedSessionId = ui.selected_session_id;
@@ -245,8 +315,25 @@ async function applyUiState(ui, resetTerminal) {
   renderHeader(ui.selected);
   renderActions(ui.selected);
 
-  if (resetTerminal || selectedChanged) {
+  if (options.deferTerminalHydration) {
+    await showSelectedTerminalShell();
+    return;
+  }
+
+  if (resetTerminal) {
     await hydrateSelectedTerminal();
+    return;
+  }
+
+  if (selectedChanged) {
+    // Reuse a clean live terminal; stale panes hydrate from the backend snapshot.
+    const entry = state.selectedSessionId ? terminalEntry(state.selectedSessionId) : null;
+    if (entry && entry.hydrated && !entry.stale) {
+      showTerminalEntry(state.selectedSessionId);
+      await fitAndResizeNow();
+    } else {
+      await hydrateSelectedTerminal();
+    }
     return;
   }
 
@@ -254,45 +341,209 @@ async function applyUiState(ui, resetTerminal) {
 }
 
 async function hydrateSelectedTerminal() {
-  if (!state.selectedSessionId) {
+  const sessionId = state.selectedSessionId;
+  if (!sessionId) {
     hideAllTerminalEntries();
     return;
   }
 
-  const entry = ensureTerminalEntry(state.selectedSessionId);
-  showTerminalEntry(state.selectedSessionId);
+  const requestId = ++state.hydrationRequestId;
+  const entry = ensureTerminalEntry(sessionId);
+  entry.hydrationRequestId = requestId;
+  entry.hydrating = true;
+  entry.hydrated = false;
+  entry.stale = false;
+  entry.pendingPushChunks = [];
+  clearQueuedTerminalWrites(entry);
+
+  showTerminalEntry(sessionId);
   entry.term.reset();
   entry.term.clear();
-  entry.hydrated = false;
-  // Discard any push data that arrived before reset — the snapshot
-  // fetched below will already include it, so replaying pendingPush
-  // would duplicate that output.
-  entry.pendingPush = '';
   await fitAndResizeNow();
 
-  const snapshot = await window.pywebview.api.get_session_snapshot(state.selectedSessionId);
-  // Discard push data again — anything that arrived between the reset
-  // above and the snapshot fetch is already inside the rendered buffer
-  // (session_snapshot drains queued PTY output before reading it).
-  entry.pendingPush = '';
+  const snapshotPayload = await getSessionSnapshotPayload(sessionId);
+  if (state.selectedSessionId !== sessionId || entry.hydrationRequestId !== requestId) {
+    entry.hydrating = false;
+    entry.stale = true;
+    return;
+  }
+
+  const snapshot = snapshotPayload.text || '';
+  const snapshotSequence = Number(snapshotPayload.sequence) || 0;
+  const pendingBeforeWrite = takePendingAfterSequence(entry, snapshotSequence);
   if (snapshot) {
     await writeToTerminal(entry.term, snapshot);
   }
+
+  if (state.selectedSessionId !== sessionId || entry.hydrationRequestId !== requestId) {
+    entry.hydrating = false;
+    entry.stale = true;
+    return;
+  }
+
+  const pendingAfterWrite = takePendingAfterSequence(entry, snapshotSequence);
+  const replayChunks = pendingBeforeWrite.concat(pendingAfterWrite);
   entry.term.scrollToBottom();
   entry.hydrated = true;
+  entry.hydrating = false;
+  entry.stale = false;
+  entry.lastSequence = Math.max(snapshotSequence, maxChunkSequence(replayChunks));
 
-  // Only flush output that arrived AFTER the transcript was captured
-  if (entry.pendingPush) {
-    entry.term.write(entry.pendingPush);
-    entry.pendingPush = '';
+  if (replayChunks.length) {
+    enqueueTerminalWrite(entry, chunksToData(replayChunks));
   }
 
 }
 
+async function getSessionSnapshotPayload(sessionId) {
+  if (window.pywebview.api.get_session_snapshot_payload) {
+    return window.pywebview.api.get_session_snapshot_payload(sessionId);
+  }
+
+  const text = await window.pywebview.api.get_session_snapshot(sessionId);
+  return { text, sequence: 0 };
+}
+
 function writeToTerminal(term, data) {
   return new Promise((resolve) => {
-    term.write(data, resolve);
+    let offset = 0;
+
+    function writeNextChunk() {
+      if (offset >= data.length) {
+        resolve();
+        return;
+      }
+
+      const nextOffset = Math.min(offset + MAX_XTERM_WRITE_CHARS, data.length);
+      term.write(data.slice(offset, nextOffset), () => {
+        offset = nextOffset;
+        window.requestAnimationFrame(writeNextChunk);
+      });
+    }
+
+    writeNextChunk();
   });
+}
+
+function normalizePtyChunks(chunksOrData, sequence = 0) {
+  if (Array.isArray(chunksOrData)) {
+    return chunksOrData
+      .map((chunk) => {
+        if (Array.isArray(chunk)) {
+          return {
+            sequence: Number(chunk[0]) || 0,
+            data: String(chunk[1] ?? ''),
+          };
+        }
+
+        return {
+          sequence: Number(chunk?.sequence) || 0,
+          data: String(chunk?.data ?? ''),
+        };
+      })
+      .filter((chunk) => chunk.data.length > 0);
+  }
+
+  const data = String(chunksOrData ?? '');
+  if (!data) {
+    return [];
+  }
+
+  return [{ data, sequence: Number(sequence) || 0 }];
+}
+
+function queuePendingPush(entry, chunks) {
+  entry.pendingPushChunks.push(...chunks);
+  entry.lastSequence = Math.max(entry.lastSequence || 0, maxChunkSequence(chunks));
+}
+
+function takePendingAfterSequence(entry, sequence) {
+  const pending = entry.pendingPushChunks;
+  entry.pendingPushChunks = [];
+  return pending.filter((chunk) => chunk.sequence > sequence || (sequence === 0 && chunk.sequence === 0));
+}
+
+function chunksToData(chunks) {
+  return chunks.map((chunk) => chunk.data).join('');
+}
+
+function maxChunkSequence(chunks) {
+  return chunks.reduce((maxSequence, chunk) => Math.max(maxSequence, Number(chunk.sequence) || 0), 0);
+}
+
+function enqueueTerminalWrite(entry, data) {
+  if (!data) {
+    return;
+  }
+
+  recoverStalledTerminalWrite(entry);
+  entry.writeBuffer = `${entry.writeBuffer || ''}${data}`;
+  if (entry.writeScheduled) {
+    return;
+  }
+
+  const generation = entry.writeGeneration || 0;
+  entry.writeScheduled = true;
+  window.requestAnimationFrame(() => flushTerminalWrite(entry, generation));
+}
+
+function flushTerminalWrite(entry, generation) {
+  if (generation !== (entry.writeGeneration || 0)) {
+    entry.writeScheduled = false;
+    return;
+  }
+
+  const data = entry.writeBuffer || '';
+  entry.writeBuffer = '';
+  if (!data) {
+    entry.writeScheduled = false;
+    entry.writeStartedAt = 0;
+    return;
+  }
+
+  const chunk = data.slice(0, MAX_XTERM_WRITE_CHARS);
+  entry.writeBuffer = `${data.slice(MAX_XTERM_WRITE_CHARS)}${entry.writeBuffer || ''}`;
+  entry.writeStartedAt = performance.now();
+
+  entry.term.write(chunk, () => {
+    if (generation !== (entry.writeGeneration || 0)) {
+      return;
+    }
+
+    if (entry.writeBuffer) {
+      window.requestAnimationFrame(() => flushTerminalWrite(entry, generation));
+      return;
+    }
+
+    entry.writeScheduled = false;
+    entry.writeStartedAt = 0;
+  });
+}
+
+function clearQueuedTerminalWrites(entry) {
+  entry.writeGeneration = (entry.writeGeneration || 0) + 1;
+  entry.writeBuffer = '';
+  entry.writeStartedAt = 0;
+  entry.writeScheduled = false;
+}
+
+function recoverStalledTerminalWrite(entry) {
+  if (!entry.writeScheduled || !entry.writeStartedAt) {
+    return;
+  }
+
+  if (performance.now() - entry.writeStartedAt < XTERM_WRITE_STALL_MS) {
+    return;
+  }
+
+  clearQueuedTerminalWrites(entry);
+  entry.hydrated = false;
+  entry.hydrating = false;
+  entry.stale = true;
+
+  if (entry === selectedTerminalEntry()) {
+    window.queueMicrotask(() => hydrateSelectedTerminal());
+  }
 }
 
 function focusSelectedTerminal() {
@@ -422,6 +673,17 @@ function selectedNode() {
   return findNode(state.ui?.tree || [], state.selectedSessionId);
 }
 
+function selectedPayloadFromNode(node) {
+  return {
+    id: node.id,
+    title: node.title,
+    status: node.status,
+    is_collapsed: node.is_collapsed,
+    initial_cwd: node.initial_cwd,
+    cwd: node.initial_cwd,
+  };
+}
+
 function createTerminal() {
   return new Terminal({
     allowTransparency: false,
@@ -474,8 +736,17 @@ function ensureTerminalEntry(sessionId) {
   entry = {
     fitAddon,
     hydrated: false,
+    hydrating: false,
+    hydrationRequestId: 0,
+    lastSequence: 0,
     mount,
+    pendingPushChunks: [],
+    stale: true,
     term,
+    writeBuffer: '',
+    writeGeneration: 0,
+    writeScheduled: false,
+    writeStartedAt: 0,
   };
   state.terminals.set(sessionId, entry);
   return entry;
@@ -503,8 +774,28 @@ async function showSelectedTerminal() {
   showTerminalEntry(state.selectedSessionId);
   await fitAndResizeNow();
 
-  if (!entry.hydrated) {
+  if (!entry.hydrated || entry.stale) {
     await hydrateSelectedTerminal();
+  }
+}
+
+async function showSelectedTerminalShell() {
+  if (!state.selectedSessionId) {
+    hideAllTerminalEntries();
+    return;
+  }
+
+  const entry = ensureTerminalEntry(state.selectedSessionId);
+  showTerminalEntry(state.selectedSessionId);
+  await fitAndResizeNow();
+
+  if (!entry.hydrated || entry.stale) {
+    clearQueuedTerminalWrites(entry);
+    entry.term.reset();
+    entry.term.clear();
+    entry.hydrated = false;
+    entry.hydrating = true;
+    entry.pendingPushChunks = [];
   }
 }
 

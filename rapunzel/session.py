@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import os
 import pty
 import select
@@ -38,6 +39,7 @@ class PTYSession:
     _reader_thread: threading.Thread | None = field(init=False, default=None, repr=False)
     _wait_thread: threading.Thread | None = field(init=False, default=None, repr=False)
     _fd_lock: threading.Lock = field(init=False, default_factory=threading.Lock, repr=False)
+    _decoder: codecs.IncrementalDecoder = field(init=False, repr=False)
 
     def start(self) -> None:
         master_fd, slave_fd = pty.openpty()
@@ -65,6 +67,7 @@ class PTYSession:
         os.close(slave_fd)
         self.master_fd = master_fd
         self.process = process
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.resize(36, 120)
 
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -164,7 +167,13 @@ class PTYSession:
             if not chunk:
                 break
 
-            self.on_output(self.session_id, chunk.decode("utf-8", errors="replace"))
+            text = self._decoder.decode(chunk)
+            if text:
+                self.on_output(self.session_id, text)
+
+        final_text = self._decoder.decode(b"", final=True)
+        if final_text:
+            self.on_output(self.session_id, final_text)
 
     def _wait_loop(self) -> None:
         assert self.process is not None

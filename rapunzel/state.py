@@ -15,11 +15,15 @@ from rapunzel.store import WorkspaceStore
 from rapunzel.terminal_screen import TerminalScreen
 
 
+MAX_TRANSCRIPT_CHARS = 1_000_000
+
+
 @dataclass(slots=True)
 class SessionEvent:
     kind: Literal["output", "exit"]
     session_id: str
     payload: str | int
+    sequence: int = 0
 
 
 class AppState:
@@ -28,8 +32,8 @@ class AppState:
     def __init__(
         self,
         store: WorkspaceStore,
-        push_output: Callable[[str, str], None] | None = None,
-        push_exit: Callable[[str, int], None] | None = None,
+        push_output: Callable[[str, str, int], None] | None = None,
+        push_exit: Callable[[str, int, int], None] | None = None,
     ) -> None:
         self.store = store
         self.tree: list[SessionNode] = []
@@ -40,7 +44,10 @@ class AppState:
         self.statuses: dict[str, str] = {}
         self.sessions: dict[str, PTYSession] = {}
         self.event_queue: queue.Queue[SessionEvent] = queue.Queue()
+        self.applied_sequences: dict[str, int] = {}
         self.next_shell_number = 1
+        self._event_sequence = 0
+        self._event_lock = threading.Lock()
         self._push_output = push_output
         self._push_exit = push_exit
 
@@ -57,6 +64,7 @@ class AppState:
             self.terminal_screens[node.id] = TerminalScreen()
             self.terminal_buffers[node.id] = ""
             self.terminal_streams[node.id] = ""
+            self.applied_sequences[node.id] = 0
             self.statuses[node.id] = "starting"
             self._start_runtime(node)
 
@@ -207,6 +215,7 @@ class AppState:
         self.terminal_buffers.pop(session_id, None)
         self.terminal_streams.pop(session_id, None)
         self.terminal_screens.pop(session_id, None)
+        self.applied_sequences.pop(session_id, None)
         self.statuses.pop(session_id, None)
 
         if self.selected_session_id == session_id:
@@ -230,6 +239,7 @@ class AppState:
             self.terminal_buffers.pop(closing_id, None)
             self.terminal_streams.pop(closing_id, None)
             self.terminal_screens.pop(closing_id, None)
+            self.applied_sequences.pop(closing_id, None)
             self.statuses.pop(closing_id, None)
 
         self.tree = [item for item in self.tree if item.id not in closing_ids]
@@ -272,7 +282,7 @@ class AppState:
         screen = self.terminal_screens.setdefault(session_id, TerminalScreen())
         rendered = screen.feed(chunk)
         self.terminal_buffers[session_id] = rendered
-        self.terminal_streams[session_id] = self.terminal_streams.get(session_id, "") + chunk
+        self._append_terminal_stream(session_id, chunk)
         self._update_last_known_cwd(session_id, chunk)
         if session_id in self.statuses and self.statuses[session_id] != "error":
             self.statuses[session_id] = "running"
@@ -282,7 +292,7 @@ class AppState:
         message = f"\n[process exited with code {exit_code}]\n"
         screen = self.terminal_screens.setdefault(session_id, TerminalScreen())
         self.terminal_buffers[session_id] = screen.append_line(message.rstrip("\n"))
-        self.terminal_streams[session_id] = self.terminal_streams.get(session_id, "") + message
+        self._append_terminal_stream(session_id, message)
         self.statuses[session_id] = f"exited {exit_code}"
         self.sessions.pop(session_id, None)
         return self.terminal_buffers[session_id]
@@ -311,6 +321,7 @@ class AppState:
         self.terminal_screens[session_id] = TerminalScreen()
         self.terminal_buffers[session_id] = ""
         self.terminal_streams[session_id] = ""
+        self.applied_sequences[session_id] = 0
         self.statuses[session_id] = "starting"
         self.selected_session_id = session_id
         self.next_shell_number += 1
@@ -328,14 +339,16 @@ class AppState:
         push_exit = self._push_exit
 
         def on_output(session_id: str, chunk: str) -> None:
-            self.event_queue.put(SessionEvent("output", session_id, chunk))
+            sequence = self._next_event_sequence()
+            self.event_queue.put(SessionEvent("output", session_id, chunk, sequence))
             if push_output is not None:
-                push_output(session_id, chunk)
+                push_output(session_id, chunk, sequence)
 
         def on_exit(session_id: str, code: int) -> None:
-            self.event_queue.put(SessionEvent("exit", session_id, code))
+            sequence = self._next_event_sequence()
+            self.event_queue.put(SessionEvent("exit", session_id, code, sequence))
             if push_exit is not None:
-                push_exit(session_id, code)
+                push_exit(session_id, code, sequence)
 
         runtime = PTYSession(
             session_id=node.id,
@@ -351,14 +364,26 @@ class AppState:
             screen = self.terminal_screens.setdefault(node.id, TerminalScreen())
             message = f"[failed to start shell: {exc}]"
             self.terminal_buffers[node.id] = screen.append_line(message)
-            self.terminal_streams[node.id] = self.terminal_streams.get(node.id, "") + message + "\n"
+            self._append_terminal_stream(node.id, message + "\n")
             return
 
         self.sessions[node.id] = runtime
         self.statuses[node.id] = "running"
 
-    def drain_events(self) -> list[dict[str, str | int]]:
+    def drain_events(self, collect: bool = True) -> list[dict[str, str | int]]:
         events: list[dict[str, str | int]] = []
+        output_chunks: dict[str, list[str]] = {}
+        output_sequences: dict[str, int] = {}
+
+        def flush_output(session_id: str | None = None) -> None:
+            session_ids = [session_id] if session_id is not None else list(output_chunks.keys())
+            for flush_id in session_ids:
+                chunks = output_chunks.pop(flush_id, None)
+                if not chunks:
+                    continue
+
+                self.apply_output(flush_id, "".join(chunks))
+                self._record_applied_sequence(flush_id, output_sequences.pop(flush_id, 0))
 
         try:
             while True:
@@ -367,32 +392,49 @@ class AppState:
                     continue
 
                 if event.kind == "output":
-                    self.apply_output(event.session_id, str(event.payload))
+                    output_chunks.setdefault(event.session_id, []).append(str(event.payload))
+                    output_sequences[event.session_id] = max(
+                        output_sequences.get(event.session_id, 0),
+                        event.sequence,
+                    )
                 elif event.kind == "exit":
+                    flush_output(event.session_id)
                     self.apply_exit(event.session_id, int(event.payload))
+                    self._record_applied_sequence(event.session_id, event.sequence)
 
-                events.append(
-                    {
-                        "kind": event.kind,
-                        "session_id": event.session_id,
-                        "payload": event.payload,
-                    }
-                )
+                if collect:
+                    events.append(
+                        {
+                            "kind": event.kind,
+                            "session_id": event.session_id,
+                            "payload": event.payload,
+                            "sequence": event.sequence,
+                        }
+                    )
         except queue.Empty:
             pass
 
+        flush_output()
         return events
 
     def session_stream(self, session_id: str | None) -> str:
-        self.drain_events()
+        self.drain_events(collect=False)
         return self.terminal_streams.get(session_id or "", "")
 
     def session_snapshot(self, session_id: str | None) -> str:
-        self.drain_events()
+        self.drain_events(collect=False)
         return self.terminal_buffers.get(session_id or "", "")
 
+    def session_snapshot_payload(self, session_id: str | None) -> dict[str, str | int]:
+        self.drain_events(collect=False)
+        resolved_id = session_id or ""
+        return {
+            "text": self.terminal_buffers.get(resolved_id, ""),
+            "sequence": self.applied_sequences.get(resolved_id, 0),
+        }
+
     def ui_state(self) -> dict[str, object]:
-        self.drain_events()
+        self.drain_events(collect=False)
         return {
             "selected_session_id": self.selected_session_id,
             "next_shell_number": self.next_shell_number,
@@ -487,6 +529,24 @@ class AppState:
                 return True
             current = self.node_by_id(current.parent_id)
         return False
+
+    def _next_event_sequence(self) -> int:
+        with self._event_lock:
+            self._event_sequence += 1
+            return self._event_sequence
+
+    def _record_applied_sequence(self, session_id: str, sequence: int) -> None:
+        if sequence <= 0:
+            return
+        self.applied_sequences[session_id] = max(self.applied_sequences.get(session_id, 0), sequence)
+
+    def _append_terminal_stream(self, session_id: str, chunk: str) -> None:
+        stream = self.terminal_streams.get(session_id, "")
+        if len(stream) + len(chunk) <= MAX_TRANSCRIPT_CHARS:
+            self.terminal_streams[session_id] = stream + chunk
+            return
+
+        self.terminal_streams[session_id] = (stream + chunk)[-MAX_TRANSCRIPT_CHARS:]
 
     def _close_runtime_async(self, session: PTYSession | None) -> None:
         if session is None:
